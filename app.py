@@ -1,9 +1,9 @@
 """
-WWBD: What Would Buffett Do?
-A classic portfolio built by fixed rules: Python screens and sizes, the AI only argues for and against.
+Mandate: your fund's investment policy, turned into a portfolio you can defend.
+Fixed rules screen the companies and size the portfolio; the AI only argues the case for and against.
 
 Run:  streamlit run app.py
-Educational project. Not financial advice. Not affiliated with Warren Buffett or Berkshire Hathaway.
+Educational project. Not financial advice.
 """
 import json
 import os
@@ -39,11 +39,8 @@ CASES_JSON = os.path.join(DATA_DIR, "last_cases.json")                 # last AI
 PRICE_START = "2019-01-01"   # far enough back to replay the COVID crash
 
 CASH_TICKER, INDEX_TICKER = "SHY", "VOO"   # short-term Treasuries; S&P 500 index fund
-CASH_SHARE = 0.10
-MAX_POSITION = 0.25
-MAX_PER_SECTOR = 3
-DISCLAIMER = ("Educational project, not financial advice. Not affiliated with or endorsed by Warren Buffett or Berkshire "
-              "Hathaway. The rules are our own reading of his published principles.")
+DISCLAIMER = ("Educational project, not financial advice. The default rules are inspired by Benjamin Graham, Warren Buffett "
+              "and Joseph Piotroski; not affiliated with or endorsed by any of them.")
 
 # Large US-listed companies plus well-known growth names.
 # Banks, insurers and property trusts are left out because these ratios don't work for them.
@@ -72,35 +69,39 @@ def _fact(value, fmt):
     return "no data" if pd.isna(value) else fmt.format(value)
 
 
-# (short name, the rule in plain English, where the idea comes from, the test, the company's actual figure)
-# Graham's original numbers are loosened for today's markets; the point is a fixed rule set anyone can check.
+# The default policy: (test, what the threshold means, default threshold, unit, where the idea comes from,
+# the test given the data and a threshold, the company's actual figure).
+# The thresholds are my own defaults, loosened from Graham's originals for today's markets; committees can change them in the app.
 CLASSIC_TESTS = [
-    ("Always profitable", "A profit in every year reported (about 4 years)", "Graham: earnings stability",
-     lambda d: (d.years_reported >= 3) & (d.loss_years == 0),
+    ("Always profitable", "Most loss-making years allowed (of about 4 reported)", 0, "years", "Graham: earnings stability",
+     lambda d, x: (d.years_reported >= 3) & (d.loss_years <= x),
      lambda r: f"{r.loss_years:.0f} of {r.years_reported:.0f} years in loss"),
-    ("Earnings growing", "Earnings per share higher than at the start of those years", "Graham: earnings growth",
-     lambda d: d.eps_latest > d.eps_oldest,
+    ("Earnings growing", "Least growth in earnings per share over those years", 0, "%", "Graham: earnings growth",
+     lambda d, x: d.eps_latest > d.eps_oldest + d.eps_oldest.abs() * x / 100,
      lambda r: f"EPS {_fact(r.eps_oldest, '{:.2f}')} to {_fact(r.eps_latest, '{:.2f}')}"),
-    ("High return on equity", "Return on equity of at least 15%", "Buffett: a good business",
-     lambda d: d["roe_%"] >= 15,
+    ("High return on equity", "Lowest return on equity", 15, "%", "Buffett: a good business",
+     lambda d, x: d["roe_%"] >= x,
      lambda r: _fact(r["roe_%"], "{:.0f}%")),
-    ("Strong margins", "Operating margin of at least 15%", "Buffett: pricing power",
-     lambda d: d["operating_margin_%"] >= 15,
+    ("Strong margins", "Lowest operating margin", 15, "%", "Buffett: pricing power",
+     lambda d, x: d["operating_margin_%"] >= x,
      lambda r: _fact(r["operating_margin_%"], "{:.0f}%")),
-    ("Modest debt", "Debt could be repaid with 4 years of free cash flow or less", "Buffett: conservative debt",
-     lambda d: d.debt_to_fcf_years <= 4,
+    ("Modest debt", "Most years of free cash flow needed to repay all debt", 4, "years", "Buffett: conservative debt",
+     lambda d, x: d.debt_to_fcf_years <= x,
      lambda r: _fact(r.debt_to_fcf_years, "{:.1f} years")),
-    ("Bills covered", "Current assets at least match current liabilities", "Graham: financial strength (he asked for double)",
-     lambda d: d.current_ratio >= 1,
+    ("Bills covered", "Lowest current ratio (current assets ÷ current liabilities)", 1, "x", "Graham: financial strength (he asked for 2)",
+     lambda d, x: d.current_ratio >= x,
      lambda r: _fact(r.current_ratio, "{:.2f}x")),
-    ("Real cash", "Free cash flow is at least 70% of reported profit", "Piotroski: earnings quality",
-     lambda d: d.fcf_to_net_income >= 0.7,
+    ("Real cash", "Lowest free cash flow as a share of reported profit", 70, "%", "Piotroski: earnings quality",
+     lambda d, x: d.fcf_to_net_income >= x / 100,
      lambda r: _fact(r.fcf_to_net_income, "{:.0%}")),
-    ("Fair price", "Price is no more than 25 times the last year's earnings", "Graham: moderate price (he asked for 15)",
-     lambda d: (d.trailing_pe > 0) & (d.trailing_pe <= 25),
+    ("Fair price", "Highest price-to-earnings ratio", 25, "x", "Graham: moderate price (he asked for 15)",
+     lambda d, x: (d.trailing_pe > 0) & (d.trailing_pe <= x),
      lambda r: _fact(r.trailing_pe, "{:.0f}x earnings")),
 ]
-TEST_NAMES = [t[0] for t in CLASSIC_TESTS]
+TESTS = {t[0]: t for t in CLASSIC_TESTS}
+DEFAULT_POLICY = pd.DataFrame([{"Use": True, "Test": name, "Threshold": float(x), "Unit": unit, "What it means": rule, "Idea from": src}
+                               for name, rule, x, unit, src, _, _ in CLASSIC_TESTS])
+DEFAULT_RULES = {"n_picks": 8, "min_tests": 7, "cash": 0.10, "max_position": 0.25, "max_per_sector": 3}
 
 # =====================================================================================
 # 2. MARKET DATA  (live from Yahoo Finance; a CSV snapshot is only a safety net)
@@ -179,42 +180,43 @@ def load_market():
     return prices.ffill(), fund, pd.Timestamp.now().strftime("%d %b %Y %H:%M"), [w for w in (w1, w2) if w]
 
 # =====================================================================================
-# 3. THE RULES  (screen the companies, then size the positions)
+# 3. THE POLICY  (screen the companies, then size the positions)
 # =====================================================================================
-def run_screen(fundamentals: pd.DataFrame) -> pd.DataFrame:
-    """Every company against every test, most tests passed then cheapest first. Missing data counts as a fail."""
+def run_screen(fundamentals: pd.DataFrame, policy: dict) -> pd.DataFrame:
+    """Every company against the fund's tests ({test: threshold}), most passed then cheapest first.
+    Missing data counts as a fail."""
     df = fundamentals.copy()
-    for name, _, _, test, _ in CLASSIC_TESTS:
-        df[name] = test(df)
-    df["tests_passed"] = df[TEST_NAMES].sum(axis=1)
-    df["tests_failed"] = df[TEST_NAMES].apply(lambda r: ", ".join(r.index[~r]) or "none", axis=1)
+    for name, x in policy.items():
+        df[name] = TESTS[name][5](df, x)
+    df["tests_passed"] = df[list(policy)].sum(axis=1)
+    df["tests_failed"] = df[list(policy)].apply(lambda r: ", ".join(r.index[~r]) or "none", axis=1)
     return df.sort_values(["tests_passed", "trailing_pe"], ascending=[False, True])
 
 
-def scorecard(df: pd.DataFrame) -> pd.DataFrame:
+def scorecard(df: pd.DataFrame, policy: dict) -> pd.DataFrame:
     """One row per company: a tick or cross for each test, next to the company's actual figure."""
-    cells = {name: [f"{'✓' if r[name] else '✗'} {fact(r)}" for _, r in df.iterrows()] for name, _, _, _, fact in CLASSIC_TESTS}
-    return pd.DataFrame({"Company": df["name"].values, "Passed": df.tests_passed.map(lambda n: f"{n}/{len(TEST_NAMES)}").values, **cells},
+    cells = {name: [f"{'✓' if r[name] else '✗'} {TESTS[name][6](r)}" for _, r in df.iterrows()] for name in policy}
+    return pd.DataFrame({"Company": df["name"].values, "Passed": df.tests_passed.map(lambda n: f"{n}/{len(policy)}").values, **cells},
                         index=df.index)
 
 
-def build_portfolio(screen: pd.DataFrame, n: int, min_tests: int, amount: float):
-    """Pick the top scorers, sector limit applied. Better scores get bigger positions; what's left stays in cash.
-    Returns (picks, holdings table, companies that passed but missed out and why)."""
+def build_portfolio(screen: pd.DataFrame, rules: dict, amount: float):
+    """Pick the top scorers within the sector limit. Each test passed above the minimum adds a share of the money;
+    anything above the position limit stays in cash. Returns (picks, holdings table, companies that passed but missed out and why)."""
     picks, sectors, skipped = [], {}, []
-    for t, r in screen[screen.tests_passed >= min_tests].iterrows():
-        if len(picks) >= n:
+    for t, r in screen[screen.tests_passed >= rules["min_tests"]].iterrows():
+        if len(picks) >= rules["n_picks"]:
             skipped.append((t, "portfolio full"))
-        elif sectors.get(r.sector, 0) >= MAX_PER_SECTOR:
-            skipped.append((t, f"already {MAX_PER_SECTOR} in {r.sector}"))
+        elif sectors.get(r.sector, 0) >= rules["max_per_sector"]:
+            skipped.append((t, f"already {rules['max_per_sector']} in {r.sector}"))
         else:
             picks.append(t)
             sectors[r.sector] = sectors.get(r.sector, 0) + 1
     chosen = screen.loc[picks]
-    points = (chosen.tests_passed - 5).clip(lower=1)   # 8/8 gets three times the money of 6/8
-    weights = (points / points.sum() * (1 - CASH_SHARE)).clip(upper=MAX_POSITION) if picks else pd.Series(dtype=float)
+    shares = chosen.tests_passed - rules["min_tests"] + 1   # one test above the minimum gets twice the money
+    weights = (shares / shares.sum() * (1 - rules["cash"])).clip(upper=rules["max_position"]) if picks else pd.Series(dtype=float)
     rows = [{"Holding": chosen.loc[t, "name"], "ticker": t, "Sector": chosen.loc[t, "sector"],
-             "Tests passed": f"{chosen.loc[t, 'tests_passed']}/{len(TEST_NAMES)}", "usd": round(weights[t] * amount)} for t in picks]
+             "Tests passed": f"{chosen.loc[t, 'tests_passed']}/{rules['n_tests']}", "usd": round(weights[t] * amount)} for t in picks]
     cash = amount - sum(r["usd"] for r in rows)
     rows.append({"Holding": "Cash reserve (short-term Treasuries)", "ticker": CASH_TICKER, "Sector": "Cash", "Tests passed": "-", "usd": cash})
     holdings = pd.DataFrame(rows)
@@ -231,11 +233,20 @@ def buy_and_hold(prices: pd.DataFrame, weights: pd.Series, start) -> pd.Series:
 def worst_drop(path: pd.Series) -> float:
     return (path / path.cummax() - 1).min()
 
+
+def policy_lines(policy: dict, rules: dict) -> list:
+    """The policy in words, for the memo."""
+    unit = lambda name: TESTS[name][3] if TESTS[name][3] in ("%", "x") else " " + TESTS[name][3]
+    lines = [f"- **{name}:** {TESTS[name][1]}: {x:g}{unit(name)} ({TESTS[name][4]})" for name, x in policy.items()]
+    return lines + [f"- **Portfolio:** up to {rules['n_picks']} companies passing at least {rules['min_tests']} of {len(policy)} tests, "
+                    f"highest scores first, then lowest price-to-earnings; at most {rules['max_per_sector']} per sector and "
+                    f"{rules['max_position']:.0%} per company; {rules['cash']:.0%} in short-term Treasuries"]
+
 # =====================================================================================
 # 4. THE CASE FOR AND AGAINST  (the AI argues; it does not choose)
 # =====================================================================================
-CASE_SYSTEM = """You help students learn from Warren Buffett's published investing principles. Fixed rules have already
-chosen these companies, and your job is to test that choice. Do not write in Buffett's voice or claim what he would actually do.
+CASE_SYSTEM = """You help a student investment fund's committee test its decisions. The fund's fixed rules have already
+chosen these companies, and your job is to challenge that choice. Do not claim to speak for any famous investor.
 
 For each company give:
 - "business": one plain sentence on what it does and how it makes money.
@@ -247,10 +258,10 @@ Write plain English a student can read.
 Reply with ONLY a JSON object: {"TICKER": {"business": "...", "case_for": "...", "case_against": "..."}}"""
 
 
-def evidence(picks: pd.DataFrame) -> dict:
+def evidence(picks: pd.DataFrame, policy: dict) -> dict:
     """Everything the AI sees about each company. Add analyst ratings and news here when they join the project."""
-    return {t: {"name": r["name"], "sector": r.sector, "business": r.business, "tests_passed": f"{r.tests_passed} of {len(TEST_NAMES)}",
-                "tests_failed": r.tests_failed, "figures": {name: fact(r) for name, _, _, _, fact in CLASSIC_TESTS}}
+    return {t: {"name": r["name"], "sector": r.sector, "business": r.business, "tests_passed": f"{r.tests_passed} of {len(policy)}",
+                "tests_failed": r.tests_failed, "figures": {name: TESTS[name][6](r) for name in policy}}
             for t, r in picks.iterrows()}
 
 
@@ -262,10 +273,10 @@ def get_client():
     return OpenAI(api_key=API_KEY, base_url=ENDPOINT or None)
 
 
-def ai_cases(picks: pd.DataFrame) -> dict:
+def ai_cases(picks: pd.DataFrame, policy: dict) -> dict:
     resp = get_client().chat.completions.create(
         model=MODEL, max_completion_tokens=8000,
-        messages=[{"role": "system", "content": CASE_SYSTEM}, {"role": "user", "content": json.dumps(evidence(picks), default=str)}])
+        messages=[{"role": "system", "content": CASE_SYSTEM}, {"role": "user", "content": json.dumps(evidence(picks, policy), default=str)}])
     found = re.search(r"\{.*\}", resp.choices[0].message.content or "", re.S)
     if not found:
         raise ValueError("no JSON in the reply")
@@ -273,43 +284,41 @@ def ai_cases(picks: pd.DataFrame) -> dict:
     return {t: reply[t] for t in picks.index if t in reply}
 
 
-def rule_case(r: pd.Series) -> dict:
+def rule_case(r: pd.Series, policy: dict) -> dict:
     """The case from the tests alone, used when the AI hasn't been asked or isn't available."""
-    said = lambda keep: "; ".join(f"{name.lower()} ({fact(r)})" for name, _, _, _, fact in CLASSIC_TESTS if bool(r[name]) == keep)
+    said = lambda keep: "; ".join(f"{name.lower()} ({TESTS[name][6](r)})" for name in policy if bool(r[name]) == keep)
     against = said(False)
-    return {"business": re.split(r"(?<=[a-z]\.)\s", r.business or "")[0],
+    first_sentence = re.split(r"(?<=[a-z]\.)(?<!Inc\.)(?<!Corp\.)(?<!Co\.)(?<!Ltd\.)\s+(?=[A-Z])", r.business or "")[0]
+    return {"business": first_sentence,
             "case_for": f"Passes: {said(True)}." if said(True) else "It passes none of the tests.",
-            "case_against": f"Fails: {against}." if against else "Passes all 8 tests, so the risk is what numbers can't show: "
+            "case_against": f"Fails: {against}." if against else f"Passes all {len(policy)} tests, so the risk is what numbers can't show: "
                                                                  "whether the business will still be this strong in 10 years."}
 
 
-def committee_memo(holdings, picks, cases, amount, min_tests, results, fetched_at) -> str:
+def saved_cases(tickers, policy: dict) -> dict | None:
+    """The last AI cases, if they were written for exactly these companies under this policy."""
+    try:
+        with open(CASES_JSON) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return saved if sorted(saved["cases"]) == sorted(tickers) and saved.get("policy") == policy else None
+
+
+def committee_memo(holdings, picks, cases, amount, policy, rules, results, fetched_at) -> str:
     """The recommendation as a Markdown memo the fund's committee can circulate and vote on."""
-    lines = [f"# Investment committee memo: ${amount:,.0f}", f"Prepared {pd.Timestamp.now():%d %b %Y} with WWBD. Market data from Yahoo Finance, as of {fetched_at}.",
+    lines = [f"# Investment committee memo: ${amount:,.0f}", f"Prepared {pd.Timestamp.now():%d %b %Y} with Mandate. Market data from Yahoo Finance, as of {fetched_at}.",
              "", "## Recommendation", "| Holding | Ticker | Tests passed | Amount | Share |", "|---|---|---|---|---|"]
     lines += [f"| {r.Holding} | {r.ticker} | {r['Tests passed']} | ${r.usd:,.0f} | {r.Share:.0f}% |" for _, r in holdings.iterrows()]
-    lines += ["", "## Method", f"Every company faced the same {len(TEST_NAMES)} tests, and only those passing at least {min_tests} were eligible:"]
-    lines += [f"- **{name}:** {rule} ({src})" for name, rule, src, _, _ in CLASSIC_TESTS]
-    lines += [f"", f"Highest scores first, then lowest price-to-earnings, at most {MAX_PER_SECTOR} per sector and {MAX_POSITION:.0%} per company. "
-              f"{CASH_SHARE:.0%} is held in short-term Treasuries.", "", "## The case for and against"]
+    lines += ["", "## The policy applied", *policy_lines(policy, rules), "", "## The case for and against"]
     for t, r in picks.iterrows():
         c = cases[t]
         lines += [f"### {r['name']} ({t})", c.get("business", ""), f"- **For:** {c.get('case_for', '')}", f"- **Against:** {c.get('case_against', '')}", ""]
     lines += ["## Against the simple alternative", "| Measure | This portfolio | Buffett's 90/10 |", "|---|---|---|"]
     lines += ["| " + " | ".join(r.values()) + " |" for r in results]
     lines += ["", "Hindsight warning: the companies were chosen with today's figures and tested on old prices, so this shows how bumpy "
-              "the ride could be, not whether the rules work.", "", f"*{DISCLAIMER}*"]
+              "the ride could be, not whether the policy works.", "", f"*{DISCLAIMER}*"]
     return "\n".join(lines)
-
-
-def saved_cases(tickers) -> dict | None:
-    """The last AI cases, if they cover exactly these companies."""
-    try:
-        with open(CASES_JSON) as f:
-            saved = json.load(f)
-    except (OSError, ValueError):
-        return None
-    return saved if sorted(saved["cases"]) == sorted(tickers) else None
 
 # =====================================================================================
 # 5. THE PAGE
@@ -337,18 +346,18 @@ def growth_chart(wide: pd.DataFrame, height: int = 280):
     return (lines + points + rule).properties(height=height)
 
 
-st.set_page_config(page_title="WWBD: What Would Buffett Do?", layout="wide")
+st.set_page_config(page_title="Mandate", layout="wide")
 st.markdown("""<style>
 h1, h2, h3, h4 { color: #0A3D7A; font-weight: 600; letter-spacing: -0.01em; }
 [data-testid="stMetric"] { background: #F2F5F9; border-left: 4px solid #0A3D7A; padding: 10px 14px; border-radius: 4px; }
 .block-container { padding-top: 2rem; max-width: 1200px; }
 </style>""", unsafe_allow_html=True)
-st.markdown("## WWBD: What Would Buffett Do?")
-st.markdown("*\"It's far better to buy a wonderful company at a fair price than a fair company at a wonderful price.\"* "
-            "Berkshire Hathaway shareholder letter, 1989")
-st.markdown("**For student-managed funds and investment clubs:** turn \\$100,000 into a short list of companies the committee can defend, "
-            "using fixed rules anyone can check.")
-st.caption("The rules screen the companies and size the portfolio. The AI never picks a stock; it only argues for and against. " + DISCLAIMER)
+st.markdown("## Mandate")
+st.markdown("**Your fund's investment policy, turned into a portfolio you can defend.**")
+st.markdown("Student-managed funds invest real money, but their members graduate every year and the fund's judgement leaves with them. "
+            "Mandate writes the policy down as rules, applies them the same way every year, and records why each company was chosen, "
+            "so any holding can be challenged against the exact test it passed or failed.")
+st.caption("The rules choose the companies and size the portfolio. The AI never picks a stock; it only argues for and against. " + DISCLAIMER)
 
 try:
     with st.spinner("Fetching live market data..."):
@@ -359,57 +368,75 @@ except Exception as e:
 for w in data_warnings:
     st.warning(f"Live data unavailable: {w}.")
 
-screen = run_screen(fundamentals.loc[[t for t in fundamentals.index if t in prices]])
+step = iter(range(1, 10))
 
-c1, c2, c3 = st.columns(3)
+# ---- Step 1: the policy
+st.markdown(f"### {next(step)} · Your fund's policy")
+st.caption("The tests and thresholds below are my defaults, loosened from Graham's originals for today's markets. "
+           "Change any threshold, or untick a test, to match your own fund's policy.")
+edited = st.data_editor(DEFAULT_POLICY, key="policy", hide_index=True, width="stretch",
+                        disabled=["Test", "Unit", "What it means", "Idea from"],
+                        column_config={"Use": st.column_config.CheckboxColumn("Use", width="small"),
+                                       "Threshold": st.column_config.NumberColumn("Threshold", min_value=0.0, step=0.5, width="small"),
+                                       "Unit": st.column_config.TextColumn("Unit", width="small")})
+policy = {r.Test: float(r.Threshold if pd.notna(r.Threshold) else TESTS[r.Test][2]) for r in edited.itertuples() if r.Use}
+if not policy:
+    st.warning("Tick at least one test to build a portfolio.")
+    st.stop()
+
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 amount = c1.number_input("Amount to invest ($)", min_value=1_000, max_value=10_000_000, value=100_000, step=1_000)
-n_picks = c2.slider("Companies to own", 5, 10, 8, help="Buffett's 1993 letter describes five to ten companies for investors who understand what they own.")
-min_tests = c3.slider("Tests a company must pass", 5, len(TEST_NAMES), 7)
-left_out = st.multiselect("Circle of competence: leave out anything you don't understand or wouldn't want to own",
-                          options=list(screen.index), format_func=lambda t: f"{t} · {STOCKS[t]}")
-pool = screen.drop(index=left_out)
-picks, holdings, skipped = build_portfolio(pool, n_picks, min_tests, amount)
-passed = pool[pool.tests_passed >= min_tests]
+rules = {"n_tests": len(policy),
+         "n_picks": c2.number_input("Companies to own", 1, 20, DEFAULT_RULES["n_picks"]),
+         "min_tests": c3.number_input(f"Tests to pass (of {len(policy)})", 1, len(policy), min(DEFAULT_RULES["min_tests"], len(policy))),
+         "cash": c4.number_input("Cash reserve (%)", 0, 100, int(DEFAULT_RULES["cash"] * 100)) / 100,
+         "max_position": c5.number_input("Most in one company (%)", 1, 100, int(DEFAULT_RULES["max_position"] * 100)) / 100,
+         "max_per_sector": c6.number_input("Most per sector", 1, 20, DEFAULT_RULES["max_per_sector"])}
+left_out = st.multiselect("Leave out any company the committee doesn't understand or won't own",
+                          options=list(fundamentals.index), format_func=lambda t: f"{t} · {STOCKS.get(t, t)}")
 
-# ---- Step 1: the screen
-st.markdown("### 1 · The screen")
-st.markdown(f"**{len(passed)} of {len(screen)} companies** pass at least {min_tests} of these {len(TEST_NAMES)} tests.")
-st.dataframe(pd.DataFrame([{"Test": n, "Rule": rule, "Idea from": src} for n, rule, src, _, _ in CLASSIC_TESTS]), width="stretch", hide_index=True)
+screen = run_screen(fundamentals.loc[[t for t in fundamentals.index if t in prices]], policy)
+pool = screen.drop(index=left_out, errors="ignore")
+picks, holdings, skipped = build_portfolio(pool, rules, amount)
+passed = pool[pool.tests_passed >= rules["min_tests"]]
+
+# ---- Step 2: the screen
+st.markdown(f"### {next(step)} · The screen")
+st.markdown(f"**{len(passed)} of {len(screen)} companies** pass at least {rules['min_tests']} of your {len(policy)} tests.")
+st.dataframe(scorecard(pool.head(15), policy), width="stretch")
 with st.expander(f"See how all {len(screen)} companies scored"):
-    st.dataframe(scorecard(screen), width="stretch")
-    st.caption(f"Yahoo Finance, as of {fetched_at}. Missing data counts as a fail. Yahoo gives about 4 years of accounts; Graham and Buffett would want far more.")
+    st.dataframe(scorecard(screen, policy), width="stretch")
+st.caption(f"Yahoo Finance, as of {fetched_at}. Missing data counts as a fail. Yahoo gives about 4 years of accounts; Graham wanted 10.")
 
-# ---- Step 2: the portfolio
-st.markdown("### 2 · The portfolio")
+# ---- Step 3: the portfolio
+st.markdown(f"### {next(step)} · The portfolio")
 if picks.empty:
-    st.info("No company passes, so the rules hold everything in cash and wait. Lower the number of tests to see more.")
+    st.info("No company meets the policy, so it all stays in cash. Loosen a threshold or lower the number of tests to see more.")
 st.dataframe(holdings[["Holding", "ticker", "Sector", "Tests passed", "usd", "Share"]], width="stretch", hide_index=True,
              column_config={"ticker": "Ticker", "usd": st.column_config.NumberColumn("Amount", format="$%d"),
                             "Share": st.column_config.ProgressColumn("Share", format="%.0f%%", min_value=0, max_value=100)})
-st.caption(f"Highest scores first, then lowest price-to-earnings, with at most {MAX_PER_SECTOR} per sector. An 8/8 gets three times the money of a 6/8, "
-           f"up to {MAX_POSITION:.0%} per company. {CASH_SHARE:.0%} stays in cash, plus anything above that limit.")
+st.caption(f"Highest scores first, then lowest price-to-earnings, with at most {rules['max_per_sector']} per sector. A company passing one test more "
+           f"than the minimum gets twice the money, up to {rules['max_position']:.0%} each. {rules['cash']:.0%} stays in cash, plus anything above that limit.")
 if skipped:
     st.caption("Passed but missed out: " + ", ".join(f"{t} ({why})" for t, why in skipped))
-if len(picks):
-    st.dataframe(scorecard(picks), width="stretch")
 
-# ---- Step 3: the case for and against
+# ---- Step 4: the case for and against
 if len(picks):
-    st.markdown("### 3 · The case for and against")
+    st.markdown(f"### {next(step)} · The case for and against")
     if USE_AI and st.button("Ask the AI to argue each case", type="primary"):
         with st.spinner("Writing the case for and against each company..."):
             try:
-                found = ai_cases(picks)
+                found = ai_cases(picks, policy)
                 with open(CASES_JSON, "w") as f:
-                    json.dump({"saved_at": pd.Timestamp.now().strftime("%d %b %Y %H:%M"), "cases": found}, f)
+                    json.dump({"saved_at": pd.Timestamp.now().strftime("%d %b %Y %H:%M"), "policy": policy, "cases": found}, f)
             except Exception as e:
                 st.warning(f"The AI isn't available right now ({str(e)[:80]}...). Showing the summary from the tests instead.")
-    saved = saved_cases(picks.index)
+    saved = saved_cases(picks.index, policy)
     if saved:
         st.caption(f"Written by AI on {saved['saved_at']} from the figures above. Business descriptions come from general knowledge, so check them.")
     else:
         st.caption("Summarised from the tests." + (" Ask the AI for a fuller argument." if USE_AI else " Add an API key for a fuller argument."))
-    cases = {t: saved["cases"][t] if saved else rule_case(r) for t, r in picks.iterrows()}
+    cases = {t: saved["cases"][t] if saved else rule_case(r, policy) for t, r in picks.iterrows()}
     for t, r in picks.iterrows():
         case = cases[t]
         with st.container(border=True):
@@ -418,10 +445,10 @@ if len(picks):
             col_for.markdown(f"**For.** {md(case.get('case_for'))}")
             col_against.markdown(f"**Against.** {md(case.get('case_against'))}")
 
-# ---- Step 4: what could go wrong
-st.markdown("### 4 · What could go wrong" if len(picks) else "### 3 · What could go wrong")
-st.markdown("Buffett's 2013 letter gives simple advice for most people: 90% in a low-cost S&P 500 fund and 10% in short-term government bonds. "
-            "That's the bar to beat, and the fairest test of whether picking companies is worth the effort.")
+# ---- Step 5: what could go wrong
+st.markdown(f"### {next(step)} · What could go wrong")
+st.markdown("Buffett's 2013 shareholder letter gives simple advice for most people: 90% in a low-cost S&P 500 fund and 10% in short-term "
+            "government bonds. That's the bar any fund picking companies has to beat.")
 weights = holdings.set_index("ticker")["usd"] / amount
 simple = pd.Series({INDEX_TICKER: 0.9, CASH_TICKER: 0.1})
 start = prices.index[-1] - pd.DateOffset(years=5)
@@ -435,11 +462,12 @@ for label, (a, b) in windows.items():
 st.dataframe(pd.DataFrame(table), width="stretch", hide_index=True)
 st.warning("Hindsight warning: these companies were chosen using today's figures, then tested on old prices, so this isn't a fair test in either "
            "direction. Today's strong profits flatter the past, while a low price today can mean the shares have already fallen. "
-           "It shows how bumpy the ride could be, not whether the rules work.")
+           "It shows how bumpy the ride could be, not whether the policy works.")
 
-# ---- For the committee
+# ---- Step 6: for the committee
 if len(picks):
-    st.markdown("### 5 · Take it to the committee")
-    st.download_button("Download the committee memo", committee_memo(holdings, picks, cases, amount, min_tests, table, fetched_at),
+    st.markdown(f"### {next(step)} · Take it to the committee")
+    st.download_button("Download the committee memo", committee_memo(holdings, picks, cases, amount, policy, rules, table, fetched_at),
                        file_name=f"committee-memo-{pd.Timestamp.now():%Y-%m-%d}.md", mime="text/markdown")
-    st.caption("The holdings, the rules behind them, the case for and against each company, and the comparison with 90/10, ready to circulate before a vote.")
+    st.caption("The holdings, the exact policy applied, the case for and against each company, and the comparison with 90/10, "
+               "ready to circulate before a vote.")
