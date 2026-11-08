@@ -1,10 +1,11 @@
 """
 Mandate: your fund's investment policy, turned into a portfolio you can defend.
-Fixed rules screen the companies and size the portfolio; the AI only argues the case for and against.
+Fixed rules screen the companies and size the portfolio; the AI only reads each pick's annual report and reports what it finds.
 
 Run:  streamlit run app.py
 Educational project. Not financial advice.
 """
+import html
 import json
 import os
 import re
@@ -35,7 +36,8 @@ USE_AI = PROVIDER != "mock" and bool(API_KEY)
 DATA_DIR = os.path.join(HERE, "data")
 PRICES_CSV = os.path.join(DATA_DIR, "prices_snapshot.csv")             # offline safety net only
 FUNDAMENTALS_CSV = os.path.join(DATA_DIR, "fundamentals_snapshot.csv")
-CASES_JSON = os.path.join(DATA_DIR, "last_cases.json")                 # last AI cases, for a Wi-Fi-proof demo
+CHECKS_JSON = os.path.join(DATA_DIR, "annual_report_checks.json")    # saved AI checks, shown to every visitor
+SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "")   # the SEC asks automated tools for a name and contact email
 PRICE_START = "2019-01-01"   # far enough back to replay the COVID crash
 
 CASH_TICKER, INDEX_TICKER = "SHY", "VOO"   # short-term Treasuries; S&P 500 index fund
@@ -243,26 +245,105 @@ def policy_lines(policy: dict, rules: dict) -> list:
                     f"{rules['max_position']:.0%} per company; {rules['cash']:.0%} in short-term Treasuries"]
 
 # =====================================================================================
-# 4. THE CASE FOR AND AGAINST  (the AI argues; it does not choose)
+# 4. THE ANNUAL-REPORT CHECK  (the AI reads; it does not choose)
 # =====================================================================================
-CASE_SYSTEM = """You help a student investment fund's committee test its decisions. The fund's fixed rules have already
-chosen these companies, and your job is to challenge that choice. Do not claim to speak for any famous investor.
+CHECK_SYSTEM = """You help a student investment fund's committee check a company that the fund's rules have already chosen.
+Read the annual-report excerpts and answer three questions the financial figures can't:
+1. Is the business easy to understand?
+2. Does it have a lasting competitive advantage?
+3. Does management report candidly and use shareholders' money sensibly?
 
-For each company give:
-- "business": one plain sentence on what it does and how it makes money.
-- "case_for": up to 2 short sentences on why it could stay a good business, citing the figures given.
-- "case_against": up to 2 short sentences giving the strongest honest reason not to own it. Tackle any failed test first.
+For each, give a "verdict" of "Strong", "Mixed" or "Weak", an "answer" of up to 2 short sentences in plain English, and a "quote":
+one sentence copied word for word from the excerpts that best supports the answer. Never paraphrase the quote.
+Judge only from the excerpts and the figures given. Don't predict the share price or claim to speak for any famous investor.
+Reply with ONLY a JSON object: {"answers": [{"question": "...", "verdict": "...", "answer": "...", "quote": "..."}]}"""
 
-Use only the figures given and never invent a number. You may describe the business from general knowledge. No price predictions.
-Write plain English a student can read.
-Reply with ONLY a JSON object: {"TICKER": {"business": "...", "case_for": "...", "case_against": "..."}}"""
+SECTIONS_10K = {"Business": r"item\s*1\s*[\.:\-–—]?\s*business",
+                "Risk factors": r"item\s*1a\s*[\.:\-–—]?\s*risk factors",
+                "Management's discussion": r"item\s*7\s*[\.:\-–—]?\s*management.s discussion"}
+NEXT_ITEM = re.compile(r"^\s*item\s*\d{1,2}[a-c]?\s*[\.:\-–—]", re.I | re.M)
+KEYWORDS = re.compile(r"compet|advantage|brand|patent|switching|network effect|pricing|market share|repurchase|buyback|dividend|"
+                      r"acquisition|capital allocation|return on", re.I)
+SECTION_CHARS = 30_000   # per section, to keep each AI call to a sensible size
 
 
 def evidence(picks: pd.DataFrame, policy: dict) -> dict:
-    """Everything the AI sees about each company. Add analyst ratings and news here when they join the project."""
-    return {t: {"name": r["name"], "sector": r.sector, "business": r.business, "tests_passed": f"{r.tests_passed} of {len(policy)}",
+    """The figures the AI sees about each company. Add analyst ratings and news here when they join the project."""
+    return {t: {"name": r["name"], "sector": r.sector, "tests_passed": f"{r.tests_passed} of {len(policy)}",
                 "tests_failed": r.tests_failed, "figures": {name: TESTS[name][6](r) for name in policy}}
             for t, r in picks.iterrows()}
+
+
+def _sec_get(url: str):
+    import requests
+    r = requests.get(url, headers={"User-Agent": SEC_USER_AGENT}, timeout=60)
+    r.raise_for_status()
+    return r
+
+
+@st.cache_data(ttl=7 * 86400, show_spinner=False)
+def sec_ciks() -> dict:
+    """Ticker -> SEC company number."""
+    return {v["ticker"]: v["cik_str"] for v in _sec_get("https://www.sec.gov/files/company_tickers.json").json().values()}
+
+
+def _plain_text(page: str) -> str:
+    """Filing HTML -> text, one paragraph per line."""
+    t = re.sub(r"<(script|style|ix:header)[^>]*>.*?</\1>", " ", page, flags=re.S | re.I)   # ix:header is hidden machine-readable data
+    t = re.sub(r"<(br|/p|/div|/tr|/li|/h\d)[^>]*>", "\n", t, flags=re.I)
+    t = html.unescape(re.sub(r"<[^>]+>", " ", t))
+    return re.sub(r"\n\s*\n+", "\n", re.sub(r"[ \t\xa0]+", " ", t))
+
+
+def filing_excerpts(text: str) -> dict:
+    """The business, risk and management-discussion sections of a 10-K, or the most relevant paragraphs of any other filing."""
+    out = {}
+    for label, pattern in SECTIONS_10K.items():
+        parts = []
+        for m in re.finditer(r"^\s*" + pattern, text, re.I | re.M):   # some filings repeat the heading on every page
+            nxt = NEXT_ITEM.search(text, m.end())
+            part = text[m.end(): nxt.start() if nxt else len(text)]
+            if len(part) > 500:   # skip the contents-page entries
+                parts.append(part)
+        if sum(map(len, parts)) > 2000:
+            out[label] = " ".join(parts)[:SECTION_CHARS]
+    if len(out) < 2:   # 20-F and other layouts: keep the blocks of text that talk most about competition and capital
+        blocks, block = [], ""
+        for line in text.split("\n"):
+            block += line.strip() + " "
+            if len(block) > 1500:
+                blocks.append(block)
+                block = ""
+        relevant = [b for b in blocks if len(KEYWORDS.findall(b)) >= 2]
+        out = {"Key passages": "\n".join(relevant)[:3 * SECTION_CHARS]}
+    return out
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def annual_report(t: str) -> dict:
+    """The company's latest 10-K or 20-F from SEC EDGAR: where it is, the full text (for checking quotes) and the excerpts the AI reads."""
+    cik = sec_ciks()[t]
+    index = _sec_get(f"https://data.sec.gov/submissions/CIK{cik:010d}.json").json()["filings"]
+    pages = [index["recent"]] + [f["name"] for f in index.get("files", [])]   # busy filers' older filings are on extra pages
+    for page in pages:
+        f = page if isinstance(page, dict) else _sec_get(f"https://data.sec.gov/submissions/{page}").json()
+        for form, acc, doc, filed in zip(f["form"], f["accessionNumber"], f["primaryDocument"], f["filingDate"]):
+            if form in ("10-K", "20-F"):
+                url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc.replace('-', '')}/{doc}"
+                text = _plain_text(_sec_get(url).text)
+                return {"form": form, "filed": filed, "url": url, "text": text, "excerpts": filing_excerpts(text)}
+    raise LookupError(f"no annual report on EDGAR for {t}")
+
+
+def _norm(s) -> str:
+    return re.sub(r"\s+", " ", str(s).replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')).strip().lower()
+
+
+def quote_found(quote: str, filing_norm: str) -> bool:
+    """True if every part of the quote (split at any '...') appears word for word in the filing."""
+    parts = [p.strip(" .") for p in re.split(r"\.\.\.|\u2026", _norm(quote))]
+    parts = [p for p in parts if len(p) > 15]
+    return bool(parts) and all(p in filing_norm for p in parts)
 
 
 def get_client():
@@ -273,19 +354,50 @@ def get_client():
     return OpenAI(api_key=API_KEY, base_url=ENDPOINT or None)
 
 
-def ai_cases(picks: pd.DataFrame, policy: dict) -> dict:
+def check_company(t: str, facts: dict) -> dict:
+    """Read one annual report and answer the three questions, with each quote checked against the filing."""
+    report = annual_report(t)
+    user = json.dumps({"company": facts, "filing": f"{report['form']} filed {report['filed']}", "excerpts": report["excerpts"]})
     resp = get_client().chat.completions.create(
-        model=MODEL, max_completion_tokens=8000,
-        messages=[{"role": "system", "content": CASE_SYSTEM}, {"role": "user", "content": json.dumps(evidence(picks, policy), default=str)}])
+        model=MODEL, max_completion_tokens=4000,
+        messages=[{"role": "system", "content": CHECK_SYSTEM}, {"role": "user", "content": user}])
     found = re.search(r"\{.*\}", resp.choices[0].message.content or "", re.S)
     if not found:
         raise ValueError("no JSON in the reply")
-    reply = json.loads(found.group(0))
-    return {t: reply[t] for t in picks.index if t in reply}
+    filing_norm = _norm(report["text"])
+    answers = [{**a, "quote": " ".join(str(a.get("quote", "")).split()), "quote_found": quote_found(a.get("quote", ""), filing_norm)}
+               for a in json.loads(found.group(0)).get("answers", [])[:3]]
+    return {"form": report["form"], "filed": report["filed"], "url": report["url"],
+            "checked_at": pd.Timestamp.now().strftime("%d %b %Y"), "answers": answers}
+
+
+def load_checks() -> dict:
+    try:
+        with open(CHECKS_JSON) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def run_checks(picks: pd.DataFrame, policy: dict) -> dict:
+    """Check every pick in parallel and save the results for every visitor. Returns {ticker: error} for any that failed."""
+    facts, errors, results = evidence(picks, policy), {}, {}
+    sec_ciks()   # fetch the ticker list once, before the threads need it
+    with ThreadPoolExecutor(max_workers=4) as pool:   # the SEC allows 10 requests a second
+        jobs = {t: pool.submit(check_company, t, facts[t]) for t in picks.index}
+    for t, job in jobs.items():
+        try:
+            results[t] = job.result()
+        except Exception as e:
+            errors[t] = str(e)[:80]
+    if results:
+        with open(CHECKS_JSON, "w") as f:
+            json.dump({**load_checks(), **results}, f, indent=1)
+    return errors
 
 
 def rule_case(r: pd.Series, policy: dict) -> dict:
-    """The case from the tests alone, used when the AI hasn't been asked or isn't available."""
+    """The case for and against from the tests alone."""
     said = lambda keep: "; ".join(f"{name.lower()} ({TESTS[name][6](r)})" for name in policy if bool(r[name]) == keep)
     against = said(False)
     first_sentence = re.split(r"(?<=[a-z]\.)(?<!Inc\.)(?<!Corp\.)(?<!Co\.)(?<!Ltd\.)\s+(?=[A-Z])", r.business or "")[0]
@@ -295,17 +407,7 @@ def rule_case(r: pd.Series, policy: dict) -> dict:
                                                                  "whether the business will still be this strong in 10 years."}
 
 
-def saved_cases(tickers, policy: dict) -> dict | None:
-    """The last AI cases, if they were written for exactly these companies under this policy."""
-    try:
-        with open(CASES_JSON) as f:
-            saved = json.load(f)
-    except (OSError, ValueError):
-        return None
-    return saved if sorted(saved["cases"]) == sorted(tickers) and saved.get("policy") == policy else None
-
-
-def committee_memo(holdings, picks, cases, amount, policy, rules, results, fetched_at) -> str:
+def committee_memo(holdings, picks, cases, checks, amount, policy, rules, results, fetched_at) -> str:
     """The recommendation as a Markdown memo the fund's committee can circulate and vote on."""
     lines = [f"# Investment committee memo: ${amount:,.0f}", f"Prepared {pd.Timestamp.now():%d %b %Y} with Mandate. Market data from Yahoo Finance, as of {fetched_at}.",
              "", "## Recommendation", "| Holding | Ticker | Tests passed | Amount | Share |", "|---|---|---|---|---|"]
@@ -313,7 +415,13 @@ def committee_memo(holdings, picks, cases, amount, policy, rules, results, fetch
     lines += ["", "## The policy applied", *policy_lines(policy, rules), "", "## The case for and against"]
     for t, r in picks.iterrows():
         c = cases[t]
-        lines += [f"### {r['name']} ({t})", c.get("business", ""), f"- **For:** {c.get('case_for', '')}", f"- **Against:** {c.get('case_against', '')}", ""]
+        lines += [f"### {r['name']} ({t})", c.get("business", ""), f"- **For:** {c.get('case_for', '')}", f"- **Against:** {c.get('case_against', '')}"]
+        if t in checks:
+            k = checks[t]
+            lines += [f"- **Annual report check** ([{k['form']} filed {k['filed']}]({k['url']}), read by AI):"]
+            lines += [f"  - **{a.get('verdict', '?')}:** {a.get('question', '')} {a.get('answer', '')} "
+                      f"Quote: \"{a.get('quote', '')}\"{'' if a.get('quote_found') else ' (not found in the filing)'}" for a in k["answers"]]
+        lines += [""]
     lines += ["## Against the simple alternative", "| Measure | This portfolio | Buffett's 90/10 |", "|---|---|---|"]
     lines += ["| " + " | ".join(r.values()) + " |" for r in results]
     lines += ["", "Hindsight warning: the companies were chosen with today's figures and tested on old prices, so this shows how bumpy "
@@ -357,7 +465,8 @@ st.markdown("**Your fund's investment policy, turned into a portfolio you can de
 st.markdown("Student-managed funds invest real money, but their members graduate every year and the fund's judgement leaves with them. "
             "Mandate writes the policy down as rules, applies them the same way every year, and records why each company was chosen, "
             "so any holding can be challenged against the exact test it passed or failed.")
-st.caption("The rules choose the companies and size the portfolio. The AI never picks a stock; it only argues for and against. " + DISCLAIMER)
+st.caption("The rules choose the companies and size the portfolio. The AI never picks a stock: it reads each pick's annual report and answers "
+           "three questions the figures can't, quoting its evidence. " + DISCLAIMER)
 
 try:
     with st.spinner("Fetching live market data..."):
@@ -423,20 +532,20 @@ if skipped:
 # ---- Step 4: the case for and against
 if len(picks):
     st.markdown(f"### {next(step)} · The case for and against")
-    if USE_AI and st.button("Ask the AI to argue each case", type="primary"):
-        with st.spinner("Writing the case for and against each company..."):
-            try:
-                found = ai_cases(picks, policy)
-                with open(CASES_JSON, "w") as f:
-                    json.dump({"saved_at": pd.Timestamp.now().strftime("%d %b %Y %H:%M"), "policy": policy, "cases": found}, f)
-            except Exception as e:
-                st.warning(f"The AI isn't available right now ({str(e)[:80]}...). Showing the summary from the tests instead.")
-    saved = saved_cases(picks.index, policy)
-    if saved:
-        st.caption(f"Written by AI on {saved['saved_at']} from the figures above. Business descriptions come from general knowledge, so check them.")
-    else:
-        st.caption("Summarised from the tests." + (" Ask the AI for a fuller argument." if USE_AI else " Add an API key for a fuller argument."))
-    cases = {t: saved["cases"][t] if saved else rule_case(r, policy) for t, r in picks.iterrows()}
+    st.caption("For and against come from the tests. The annual-report check is done by AI: it reads each company's latest annual report "
+               "from SEC EDGAR and judges what the figures can't. Every quote is checked word for word against the filing.")
+    checks = load_checks()
+    todo = [t for t in picks.index if t not in checks]
+    if todo and USE_AI and SEC_USER_AGENT:
+        if st.button(f"Read the annual reports for {len(todo)} {'company' if len(todo) == 1 else 'companies'} (AI)", type="primary"):
+            with st.spinner("Reading annual reports from SEC EDGAR..."):
+                errors = run_checks(picks.loc[todo], policy)
+            for t, e in errors.items():
+                st.warning(f"{t}: couldn't check the annual report ({e}).")
+            checks = load_checks()
+    elif todo:
+        st.caption(f"{len(todo)} of {len(picks)} not checked yet. Running the check needs an AI key and SEC_USER_AGENT in .env.")
+    cases = {t: rule_case(r, policy) for t, r in picks.iterrows()}
     for t, r in picks.iterrows():
         case = cases[t]
         with st.container(border=True):
@@ -444,6 +553,16 @@ if len(picks):
             col_for, col_against = st.columns(2)
             col_for.markdown(f"**For.** {md(case.get('case_for'))}")
             col_against.markdown(f"**Against.** {md(case.get('case_against'))}")
+            if t in checks:
+                k = checks[t]
+                st.markdown(f"**Annual report check** · [{k['form']} filed {k['filed']}]({k['url']}) · read by AI on {k['checked_at']}")
+                for a in k["answers"]:
+                    colour = {"Strong": "green", "Mixed": "orange", "Weak": "red"}.get(a.get("verdict"), "gray")
+                    st.markdown(f":{colour}[**{a.get('verdict', '?')}**] · *{md(a.get('question'))}* {md(a.get('answer'))}")
+                    found = "found in the filing" if a.get("quote_found") else "⚠ not found in the filing, so treat this answer with caution"
+                    st.caption(f"\u201c{md(a.get('quote'))}\u201d ({found})")
+            else:
+                st.caption("Annual report not checked yet.")
 
 # ---- Step 5: what could go wrong
 st.markdown(f"### {next(step)} · What could go wrong")
@@ -467,7 +586,7 @@ st.warning("Hindsight warning: these companies were chosen using today's figures
 # ---- Step 6: for the committee
 if len(picks):
     st.markdown(f"### {next(step)} · Take it to the committee")
-    st.download_button("Download the committee memo", committee_memo(holdings, picks, cases, amount, policy, rules, table, fetched_at),
+    st.download_button("Download the committee memo", committee_memo(holdings, picks, cases, checks, amount, policy, rules, table, fetched_at),
                        file_name=f"committee-memo-{pd.Timestamp.now():%Y-%m-%d}.md", mime="text/markdown")
-    st.caption("The holdings, the exact policy applied, the case for and against each company, and the comparison with 90/10, "
+    st.caption("The holdings, the exact policy applied, the case for and against each company with its annual-report check, and the comparison with 90/10, "
                "ready to circulate before a vote.")
